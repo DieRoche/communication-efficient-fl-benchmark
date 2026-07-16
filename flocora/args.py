@@ -97,9 +97,9 @@ def create_parser():
     parser.add_argument("--quant_bits", type=int,default=8,help="number of bits for fakequant")
 
     ## Wandb
-    parser.add_argument("--wandb", action="store_true", default=True, help="enable Weights & Biases logging")
-    parser.add_argument("--entity", type=str,default="dracoflow-upe",help="wandb entity name")
-    parser.add_argument("--wandb_prj_name", type=str,default="compression_FL",help="compression_FL")
+    parser.add_argument("--wandb", action="store_true", default=False, help="enable Weights & Biases logging")
+    parser.add_argument("--entity", type=str, default=None, help="optional wandb entity; defaults to the logged-in user")
+    parser.add_argument("--wandb_prj_name", type=str, default="communication-efficient-fl-benchmark", help="wandb project name")
 
     ##FedProx
     parser.add_argument("--mu", type=float,default=0.01,help="fedprox proximal factor")

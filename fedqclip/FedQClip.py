@@ -29,11 +29,12 @@ wandb_run_name = (
     f"FedQClip_{args.dataset}_{args.model}_{participating_clients}cl"
 )
 
-wandb.init(
-    project="compression_FL",
-    config={k: v for k, v in vars(args).items()},
-    name=wandb_run_name,
-)
+if args.wandb_enabled:
+    wandb.init(
+        project=args.wandb_project,
+        config={k: v for k, v in vars(args).items()},
+        name=wandb_run_name,
+    )
 
 num_clients = args.n_client
 num_rounds = args.n_epoch
@@ -479,7 +480,8 @@ initial_report = {
     "total_flops_decompression": total_decompression_flops,
     "total_flops_including_compression": total_flops,
 }
-wandb.log(initial_report, step=0)
+if args.wandb_enabled:
+    wandb.log(initial_report, step=0)
 print(f"Initial Validation Acc: {initial_acc.item():.4f}")
 
 for round_idx in range(num_rounds):
@@ -639,7 +641,8 @@ for round_idx in range(num_rounds):
 
     report["round"] = round_idx + 1
 
-    wandb.log(report, step=round_idx + 1)
+    if args.wandb_enabled:
+        wandb.log(report, step=round_idx + 1)
 
     print(f"Round {round_idx + 1}, Clients Val Acc: {acc_clients_mean:.4f}, Server Acc: {acc.item():.4f}")
     cleanup_memory()

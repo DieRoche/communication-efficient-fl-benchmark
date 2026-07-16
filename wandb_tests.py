@@ -205,15 +205,15 @@ def export_by_run_name(entity, project, group, metrics, out_dir):
 # ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ENTITY  = "dracoflow-upe"
-    PROJECT = "compression_FL" #Gauss-Southwell #compression_FL
-    GROUP   = "compress_v2" #German new run  # Cifar10
-    
+    ENTITY = os.environ.get("WANDB_ENTITY")
+    if not ENTITY:
+        raise SystemExit("Set WANDB_ENTITY explicitly before exporting W&B runs.")
+    PROJECT = os.environ.get("WANDB_PROJECT", "communication-efficient-fl-benchmark")
+    GROUP = os.environ.get("WANDB_GROUP")
+    if not GROUP:
+        raise SystemExit("Set WANDB_GROUP explicitly before exporting W&B runs.")
 
-    if PROJECT == "compression_FL":
-        out_dir = "compression_FL_complemento"
-    else:
-        out_dir = f"{PROJECT}_wandb"
+    out_dir = f"{PROJECT}_wandb"
 
     METRICS = [
         "acc_servers_highest",
@@ -231,11 +231,10 @@ if __name__ == "__main__":
         "download_traffic",
         "upload_traffic",
         "upload_traffic_per_client",
-        
+
         "training_flops",
         "evaluation_flops",
         "aggregation_flops",
     ]
 
     export_by_run_name(ENTITY, PROJECT, GROUP, METRICS, out_dir)
-    

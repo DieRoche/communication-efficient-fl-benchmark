@@ -16,7 +16,7 @@ EXCLUDED_METRICS = {"train_loss", "train_accuracy", "sparsity"}
 class WandbHistory(History):
     """History class for training and/or evaluation metrics collection."""
 
-    def __init__(self, use_wandb: bool = True) -> None:
+    def __init__(self, use_wandb: bool = False) -> None:
         """Initialize the history.
 
         Parameters

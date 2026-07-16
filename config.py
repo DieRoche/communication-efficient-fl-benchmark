@@ -31,8 +31,8 @@ def get_config():
     parser = argparse.ArgumentParser(
         description="Federated Averaging Experiments")
     parser.add_argument("--method", type=str, default="fedavg")
-    parser.add_argument("--n_client", type=int, default=10)
-    parser.add_argument("--client_fraction", type=float, default=1.0)
+    parser.add_argument("--n_client", type=int, default=100)
+    parser.add_argument("--client_fraction", type=float, default=0.1)
     parser.add_argument("--dirichlet", type=float, default=0.5)
     parser.add_argument("--n_epoch", type=int, default=100)
     parser.add_argument("--n_client_epoch", type=int, default=5)
@@ -73,7 +73,8 @@ def get_config():
             "otherwise 32-bit)."
         ),
     )
-    parser.add_argument("--wandb_enabled", type=str2bool, default=True)
+    parser.add_argument("--wandb_enabled", type=str2bool, default=False)
+    parser.add_argument("--wandb_project", type=str, default="communication-efficient-fl-benchmark")
 
     parser.add_argument("--device", type=str, default="cuda")
 

@@ -418,7 +418,7 @@ def main():
 
     if args.wandb_enabled:
         wandb.init(
-            project="Gauss-Southwell",
+            project=args.wandb_project,
             name=run_name,
             config={k: v for k, v in vars(args).items()},
         )
