@@ -38,6 +38,7 @@ def get_config():
 
     parser.add_argument("--wandb_enabled", type=str2bool, default=False)
     parser.add_argument("--wandb_project", type=str, default="communication-efficient-fl-benchmark")
+    parser.add_argument("--wandb_mode", choices=["offline", "online", "disabled"], default="offline")
 
     parser.add_argument("--device", type=str, default="cuda")
 

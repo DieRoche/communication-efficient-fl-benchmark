@@ -1,0 +1,1415 @@
+import copy
+import csv
+import gc
+import io
+import math
+import os
+import random
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import wandb
+
+from config import get_config
+from data_utils import get_dataset
+from compression import compress_csr, decompress_csr, pack_csr, unpack_csr
+from resnet18 import BasicBlock, ResNet18
+
+
+WANDB_METRIC_ALLOWLIST = (
+    "compression_flops_clients",
+    "decompression_flops_clients",
+    "round_flops",
+    "compression_flops_server",
+    "decompression_flops_server",
+    "acc_servers_highest",
+    "overall_traffic",
+    "upload_traffic",
+    "download_traffic",
+    "client_id",
+    "round",
+    "sparsity",
+)
+
+
+def filter_wandb_metrics(report):
+    return {key: report[key] for key in WANDB_METRIC_ALLOWLIST if key in report}
+
+
+def log_wandb_metrics(report, **kwargs):
+    wandb_payload = filter_wandb_metrics(report)
+    if wandb_payload:
+        wandb.log(wandb_payload, **kwargs)
+
+
+def estimate_module_forward_flops(module, inputs, output):
+    if not torch.is_tensor(output):
+        return 0.0
+
+    if isinstance(module, torch.nn.Conv2d):
+        batch, out_channels, out_h, out_w = output.shape
+        kernel_h, kernel_w = module.kernel_size
+        in_channels_per_group = module.in_channels // module.groups
+        return float(
+            2
+            * batch
+            * out_channels
+            * out_h
+            * out_w
+            * in_channels_per_group
+            * kernel_h
+            * kernel_w
+        )
+    if isinstance(module, torch.nn.Linear):
+        batch = output.shape[0] if output.ndim > 1 else 1
+        return float(2 * batch * module.in_features * module.out_features)
+    if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+        return float(4 * output.numel())
+    if isinstance(module, torch.nn.ReLU):
+        return float(output.numel())
+    if isinstance(module, torch.nn.MaxPool2d):
+        kernel = module.kernel_size
+        kernel_h, kernel_w = (kernel, kernel) if isinstance(kernel, int) else kernel
+        return float(output.numel() * kernel_h * kernel_w)
+    if isinstance(module, BasicBlock):
+        return float(output.numel())
+    if isinstance(module, torch.nn.AdaptiveAvgPool2d):
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return 0.0
+        input_numel = inputs[0].numel()
+        output_numel = output.numel()
+        return float(input_numel + output_numel)
+    return 0.0
+
+
+def should_register_flop_hook(module):
+    return isinstance(
+        module,
+        (
+            torch.nn.Conv2d,
+            torch.nn.Linear,
+            torch.nn.BatchNorm1d,
+            torch.nn.BatchNorm2d,
+            torch.nn.BatchNorm3d,
+            torch.nn.ReLU,
+            torch.nn.MaxPool2d,
+            torch.nn.AdaptiveAvgPool2d,
+            BasicBlock,
+        ),
+    )
+
+
+def register_forward_flop_hooks(model, flops_state):
+    handles = []
+
+    def _hook(module, inputs, output):
+        flops_state["forward_flops"] += estimate_module_forward_flops(module, inputs, output)
+
+    for module in model.modules():
+        if should_register_flop_hook(module):
+            handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
+
+
+def register_residual_add_flop_hooks(model, flops_state):
+    handles = []
+
+    def _hook(module, _inputs, output):
+        if torch.is_tensor(output):
+            flops_state["residual_add_flops"] += float(output.numel())
+
+    for module in model.modules():
+        if isinstance(module, BasicBlock):
+            handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
+def client_update(model, loader, epochs, device, lr, collect_flops=False):
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    forward_flops = 0.0
+    optimizer_steps = 0
+    handles = []
+    flops_state = {"forward_flops": 0.0}
+    if collect_flops:
+        handles = register_forward_flop_hooks(model, flops_state)
+    try:
+        for _ in range(epochs):
+            for data, target in loader:
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = F.cross_entropy(output, target)
+                loss.backward()
+                optimizer.step()
+                optimizer_steps += 1
+    finally:
+        for handle in handles:
+            handle.remove()
+    if collect_flops:
+        forward_flops = flops_state["forward_flops"]
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        backward_flops = 2.0 * forward_flops
+        optimizer_flops = 2.0 * trainable_params * optimizer_steps
+        training_flops = forward_flops + backward_flops + optimizer_flops
+        return model.state_dict(), float(training_flops)
+    return model.state_dict(), 0.0
+
+
+def evaluate(model, loader, device, collect_flops=False):
+    model.eval()
+    loss = 0.0
+    correct = 0
+    total = 0
+    eval_forward_flops = 0.0
+    handles = []
+    flops_state = {"forward_flops": 0.0}
+    if collect_flops:
+        handles = register_forward_flop_hooks(model, flops_state)
+    try:
+        with torch.no_grad():
+            for data, target in loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                loss += F.cross_entropy(output, target, reduction="sum").item()
+                pred = output.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if collect_flops:
+        eval_forward_flops = flops_state["forward_flops"]
+    return loss / total, correct / total, float(eval_forward_flops)
+
+def tensor_dict_bytes(tensor_dict):
+    return sum(t.element_size() * t.nelement() for t in tensor_dict.values())
+
+
+def serialized_tensor_dict_bytes(tensor_dict):
+    buffer = io.BytesIO()
+    torch.save({k: v.detach().cpu() for k, v in tensor_dict.items()}, buffer)
+    return len(buffer.getvalue())
+
+
+def compute_upload_traffic_for_round(per_client_upload_bytes):
+    return int(sum(per_client_upload_bytes))
+
+
+def compute_download_traffic_for_round(server_payload_bytes, active_clients):
+    return int(server_payload_bytes) * int(active_clients)
+
+
+def compute_overall_traffic_for_round(upload_traffic, download_traffic):
+    return int(upload_traffic) + int(download_traffic)
+
+
+def estimate_local_training_flops(num_model_params, train_samples_processed):
+    # Coarse proxy: forward + backward + parameter update per sample.
+    flops_per_sample = 6 * int(num_model_params)
+    return int(train_samples_processed) * flops_per_sample
+
+
+def estimate_evaluation_flops(num_model_params, eval_samples_processed):
+    # Coarse proxy: forward pass only per sample.
+    flops_per_sample = 2 * int(num_model_params)
+    return int(eval_samples_processed) * flops_per_sample
+
+
+def estimate_aggregation_flops(total_params, active_clients):
+    if active_clients <= 0:
+        return 0
+    # Weighted sum across client deltas + global model update.
+    weighted_sum_flops = total_params * (1 + max(0, active_clients - 1) * 2)
+    global_update_flops = total_params
+    return int(weighted_sum_flops + global_update_flops)
+
+
+def compute_round_flops(local_training_flops, aggregation_flops, evaluation_flops):
+    return int(local_training_flops + aggregation_flops + evaluation_flops)
+
+
+def compute_round_flops_compression(
+    compression_flops,
+    decompression_flops,
+    serialization_flops,
+    compression_pipeline_flops,
+):
+    return int(compression_flops + decompression_flops + serialization_flops + compression_pipeline_flops)
+
+
+def update_total_flops_metrics(total_flops_compression, total_flops, round_flops_compression, round_flops):
+    updated_total_flops_compression = int(total_flops_compression + round_flops_compression)
+    updated_total_flops = int(total_flops + round_flops)
+    return updated_total_flops_compression, updated_total_flops
+
+
+def _sum_profiler_flops(prof):
+    total = 0
+    for evt in prof.key_averages():
+        total += int(getattr(evt, "flops", 0) or 0)
+    return int(total)
+
+
+def estimate_payload_serialization_flops(payload):
+    if payload["mode"] == "csr":
+        dense_numel = int(payload.get("dense_numel", 0))
+        nnz = int(payload.get("nnz", 0))
+        return int(dense_numel + nnz)
+    if payload["mode"] == "bitmask_values":
+        numel = int(payload.get("numel", 0))
+        nnz = int(payload.get("nnz", 0))
+        return int(numel + nnz)
+    return int(payload["q_tensor"].numel())
+
+
+def compressed_tensor_bytes(tensor, compression_type):
+    if compression_type == "bitmask_values":
+        dense_tensor = tensor.detach().cpu()
+        nnz = int(torch.count_nonzero(dense_tensor).item())
+        return bitmask_payload_bytes(
+            dense_tensor.numel(),
+            nnz,
+            bits=None,
+            element_size=dense_tensor.element_size(),
+        )
+
+    if tensor.ndim == 1:
+        return tensor.element_size() * tensor.nelement()
+
+    dense_tensor = tensor.detach().cpu()
+    if tensor.ndim == 2:
+        dense = dense_tensor.numpy()
+    elif tensor.ndim == 4:
+        dense = dense_tensor.reshape(dense_tensor.size(0), -1).numpy()
+    else:
+        return tensor.element_size() * tensor.nelement()
+    if compression_type == "CSR":
+        csr = compress_csr(dense)
+        packet = pack_csr(csr)
+        return len(packet)
+    raise ValueError(f"Unknown compression type: {compression_type}")
+
+
+def quantize_tensor(tensor, bits):
+    if bits is None:
+        return tensor.clone()
+    if bits == 16:
+        return tensor.to(torch.float16).to(dtype=tensor.dtype)
+
+    if bits != 8:
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+
+    if tensor.numel() == 0:
+        return tensor.clone()
+
+    absmax = tensor.abs().max()
+    if absmax.item() == 0.0:
+        return torch.zeros_like(tensor)
+
+    qmax = (1 << (bits - 1)) - 1
+    scale = absmax / qmax
+    q = torch.round(tensor / scale).clamp(-qmax, qmax).to(torch.int8)
+    return (q.to(torch.float32) * scale).to(dtype=tensor.dtype)
+
+
+def quantize_tensor_for_transport(tensor, bits):
+    if bits is None:
+        return tensor.clone(), None
+    if bits == 16:
+        return tensor.to(torch.float16), None
+    if bits != 8:
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+    if tensor.numel() == 0:
+        return torch.empty_like(tensor, dtype=torch.int8), 1.0
+
+    absmax = tensor.abs().max()
+    if absmax.item() == 0.0:
+        return torch.zeros_like(tensor, dtype=torch.int8), 1.0
+
+    qmax = (1 << (bits - 1)) - 1
+    scale = (absmax / qmax).item()
+    q = torch.round(tensor / scale).clamp(-qmax, qmax).to(torch.int8)
+    return q, scale
+
+
+def dequantize_tensor_from_transport(q_tensor, scale, bits, target_dtype):
+    if bits is None:
+        return q_tensor.to(dtype=target_dtype)
+    if bits == 16:
+        return q_tensor.to(dtype=target_dtype)
+    if bits != 8:
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+    return (q_tensor.to(torch.float32) * float(scale)).to(dtype=target_dtype)
+
+
+def quantize_state_dict(state_dict, bits):
+    return {k: quantize_tensor(v, bits) for k, v in state_dict.items()}
+
+
+def bitmask_value_bytes(nnz, bits, element_size=4):
+    if bits is None:
+        return int(nnz) * int(element_size)
+    if bits == 16:
+        return int(nnz) * 2
+    if bits == 8:
+        return int(nnz) + 4
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def nnz_value_bytes_from_tensor(tensor, bits):
+    dense_tensor = tensor.detach().cpu()
+    nnz = int(torch.count_nonzero(dense_tensor).item())
+    return bitmask_value_bytes(nnz, bits, element_size=dense_tensor.element_size())
+
+
+def bitmask_payload_bytes(numel, nnz, bits, element_size=4):
+    mask_bytes = math.ceil(int(numel) / 8)
+    value_bytes = bitmask_value_bytes(nnz, bits, element_size=element_size)
+    return int(mask_bytes + value_bytes)
+
+
+
+def csr_compatible_tensor(tensor):
+    return tensor.ndim in (2, 4)
+
+
+def csr_matrix_shape_for_tensor(tensor):
+    if tensor.ndim == 2:
+        return int(tensor.shape[0]), int(tensor.shape[1])
+    if tensor.ndim == 4:
+        return int(tensor.shape[0]), int(tensor.numel() // tensor.shape[0])
+    raise ValueError("CSR supports only 2D tensors and 4D tensors reshaped by output channel")
+
+
+def estimate_dense_payload_bytes(tensor, bits):
+    return int(quantized_tensor_bytes(tensor.detach().cpu(), bits))
+
+
+def estimate_bitmask_values_payload_bytes(tensor, nnz, bits):
+    dense_tensor = tensor.detach().cpu()
+    return bitmask_payload_bytes(
+        dense_tensor.numel(),
+        nnz,
+        bits,
+        element_size=dense_tensor.element_size(),
+    )
+
+
+def csr_index_width_bytes(rows, cols, nnz, dynamic_quantization):
+    if dynamic_quantization and max(int(cols) - 1, int(nnz), 0) <= 65535:
+        return 2
+    return 4
+
+
+def estimate_csr_payload_bytes(tensor, nnz, bits, dynamic_quantization=False):
+    rows, cols = csr_matrix_shape_for_tensor(tensor)
+    if bits is None:
+        value_bytes_each = tensor.detach().cpu().element_size()
+    elif bits == 16:
+        value_bytes_each = 2
+    elif bits == 8:
+        value_bytes_each = 1
+    else:
+        raise ValueError(f"Unsupported quantization bits: {bits}")
+    idx_bytes = csr_index_width_bytes(rows, cols, nnz, dynamic_quantization)
+    # pack_csr uses a fixed 31-byte header that always reserves a float32 scale slot.
+    return int(31 + (int(nnz) * value_bytes_each) + ((rows + 1) * idx_bytes) + (int(nnz) * idx_bytes))
+
+
+def select_automatic_compression_format(
+    tensor,
+    bits=None,
+    dynamic_quantization=False,
+    csr_threshold=0.90,
+    bitmask_threshold=0.85,
+    min_tensor_size=1024,
+):
+    cpu_tensor = tensor.detach().cpu()
+    numel = int(cpu_tensor.numel())
+    nnz = int(torch.count_nonzero(cpu_tensor).item()) if numel else 0
+    sparsity = 1.0 if numel == 0 else 1.0 - (nnz / numel)
+    stats = {"numel": numel, "nnz": nnz, "sparsity": float(sparsity), "selection_flops": numel}
+    dense_bytes = estimate_dense_payload_bytes(cpu_tensor, bits)
+    stats["dense_bytes"] = dense_bytes
+
+    if (
+        numel == 0
+        or cpu_tensor.ndim == 0
+        or numel < int(min_tensor_size)
+        or not torch.is_floating_point(cpu_tensor)
+    ):
+        stats.update({"bitmask_bytes": None, "csr_bytes": None})
+        return "dense", stats
+
+    bitmask_bytes = estimate_bitmask_values_payload_bytes(cpu_tensor, nnz, bits)
+    stats["bitmask_bytes"] = bitmask_bytes
+    csr_bytes = None
+    if csr_compatible_tensor(cpu_tensor):
+        csr_bytes = estimate_csr_payload_bytes(cpu_tensor, nnz, bits, dynamic_quantization)
+    stats["csr_bytes"] = csr_bytes
+
+    if sparsity >= csr_threshold:
+        if csr_bytes is not None and csr_bytes < dense_bytes:
+            return "CSR", stats
+        return ("bitmask_values" if bitmask_bytes < dense_bytes else "dense"), stats
+
+    if sparsity < bitmask_threshold:
+        return ("bitmask_values" if bitmask_bytes < dense_bytes else "dense"), stats
+
+    candidates = [(dense_bytes, 0, "dense")]
+    if bitmask_bytes < dense_bytes:
+        candidates.append((bitmask_bytes, 1, "bitmask_values"))
+    if csr_bytes is not None and csr_bytes < dense_bytes:
+        candidates.append((csr_bytes, 2, "CSR"))
+    # Lower size wins; dense has priority 0 for deterministic ties.
+    return min(candidates, key=lambda item: (item[0], item[1]))[2], stats
+
+def serialize_tensor_payload(
+    tensor,
+    bits,
+    enable_sparse_masking,
+    dynamic_quantization=False,
+    sparsity_compression="CSR",
+    automatic_csr_sparsity_threshold=0.90,
+    automatic_bitmask_sparsity_threshold=0.85,
+    automatic_min_tensor_size=1024,
+):
+    cpu_tensor = tensor.detach().cpu()
+    transport_dtype = str(cpu_tensor.dtype)
+    requested_compression = sparsity_compression
+    automatic_stats = None
+    if sparsity_compression == "Automatic":
+        if enable_sparse_masking:
+            sparsity_compression, automatic_stats = select_automatic_compression_format(
+                cpu_tensor,
+                bits=bits,
+                dynamic_quantization=dynamic_quantization,
+                csr_threshold=automatic_csr_sparsity_threshold,
+                bitmask_threshold=automatic_bitmask_sparsity_threshold,
+                min_tensor_size=automatic_min_tensor_size,
+            )
+        else:
+            sparsity_compression = "dense"
+            automatic_stats = {
+                "numel": int(cpu_tensor.numel()),
+                "nnz": int(torch.count_nonzero(cpu_tensor).item()) if cpu_tensor.numel() else 0,
+                "sparsity": 0.0 if cpu_tensor.numel() else 1.0,
+                "selection_flops": 0,
+            }
+
+    use_csr = enable_sparse_masking and sparsity_compression == "CSR" and cpu_tensor.ndim in (2, 4)
+    if use_csr:
+        csr_shape = tuple(cpu_tensor.shape)
+        dense_2d = cpu_tensor if cpu_tensor.ndim == 2 else cpu_tensor.reshape(cpu_tensor.size(0), -1)
+        dense_numel = dense_2d.numel()
+        csr = compress_csr(dense_2d.numpy())
+        values = torch.from_numpy(csr.values)
+        q_values, scale = quantize_tensor_for_transport(values, bits)
+        q_csr = type(csr)(
+            values=q_values.cpu().numpy(),
+            col_indices=csr.col_indices,
+            row_ptr=csr.row_ptr,
+            shape=csr.shape,
+        )
+        packet = pack_csr(q_csr, dynamic_quantization=dynamic_quantization, scale=scale)
+        return {
+            "mode": "csr",
+            "packet": packet,
+            "bits": bits,
+            "transport_dtype": transport_dtype,
+            "orig_shape": csr_shape,
+            "nnz": int(csr.values.size),
+            "dense_numel": int(dense_numel),
+            "requested_mode": requested_compression,
+            "selected_format": "CSR",
+            "automatic_stats": automatic_stats,
+        }, len(packet)
+
+    if enable_sparse_masking and sparsity_compression == "bitmask_values":
+        flat = cpu_tensor.reshape(-1)
+        mask = flat != 0
+        selected_values = flat[mask]
+        q_values, scale = quantize_tensor_for_transport(selected_values, bits)
+        packed_mask = np.packbits(mask.numpy().astype(np.uint8))
+        nnz = int(mask.sum().item())
+        payload = {
+            "mode": "bitmask_values",
+            "packed_mask": packed_mask,
+            "q_values": q_values.cpu(),
+            "scale": scale,
+            "bits": bits,
+            "transport_dtype": transport_dtype,
+            "orig_shape": tuple(cpu_tensor.shape),
+            "numel": int(flat.numel()),
+            "nnz": nnz,
+            "requested_mode": requested_compression,
+            "selected_format": "bitmask_values",
+            "automatic_stats": automatic_stats,
+        }
+        payload_size = len(packed_mask) + bitmask_value_bytes(
+            nnz,
+            bits,
+            element_size=selected_values.element_size(),
+        )
+        return payload, payload_size
+
+    q_tensor, scale = quantize_tensor_for_transport(cpu_tensor, bits)
+    payload = {
+        "mode": "dense",
+        "q_tensor": q_tensor,
+        "scale": scale,
+        "bits": bits,
+        "transport_dtype": transport_dtype,
+        "orig_shape": tuple(cpu_tensor.shape),
+        "requested_mode": requested_compression,
+        "selected_format": "dense",
+        "automatic_stats": automatic_stats,
+    }
+    payload_bytes = quantized_tensor_bytes(cpu_tensor, bits)
+    return payload, payload_bytes
+
+
+def deserialize_tensor_payload(payload):
+    bits = payload.get("bits", None)
+    target_dtype = getattr(torch, payload["transport_dtype"].split(".")[-1])
+
+    if payload["mode"] == "csr":
+        csr_q, header = unpack_csr(payload["packet"])
+        val_bits = header["val_bits"]
+        if val_bits == 8:
+            if header.get("has_scale", False):
+                bits = 8
+                scale = header["scale"]
+            else:
+                bits = None
+                scale = None
+        elif val_bits == 16:
+            bits = 16
+            scale = None
+        elif val_bits in (32, 64):
+            bits = None
+            scale = None
+        else:
+            raise ValueError(f"Unsupported val_bits in packet: {val_bits}")
+        q_values = torch.from_numpy(csr_q.values.copy())
+        values = dequantize_tensor_from_transport(q_values, scale, bits, target_dtype).numpy()
+        csr_deq = type(csr_q)(
+            values=values,
+            col_indices=csr_q.col_indices,
+            row_ptr=csr_q.row_ptr,
+            shape=csr_q.shape,
+        )
+        dense = decompress_csr(csr_deq)
+        tensor = torch.from_numpy(dense).reshape(payload["orig_shape"])
+        return tensor.to(dtype=target_dtype)
+
+    if payload["mode"] == "bitmask_values":
+        mask_np = np.unpackbits(payload["packed_mask"])[: payload["numel"]].astype(bool)
+        assert int(mask_np.sum()) == int(payload["nnz"]), "Bitmask nnz mismatch"
+        q_values = torch.as_tensor(payload["q_values"])
+        values = dequantize_tensor_from_transport(q_values, payload["scale"], bits, target_dtype)
+        assert int(values.numel()) == int(payload["nnz"]), "Bitmask values length mismatch"
+        flat = torch.zeros(int(payload["numel"]), dtype=target_dtype)
+        flat[torch.from_numpy(mask_np)] = values
+        return flat.reshape(payload["orig_shape"])
+
+    if payload["mode"] == "dense":
+        q_tensor = payload["q_tensor"]
+        tensor = dequantize_tensor_from_transport(q_tensor, payload["scale"], bits, target_dtype)
+        return tensor.reshape(payload["orig_shape"]).to(dtype=target_dtype)
+
+    raise ValueError(f"Unknown payload mode: {payload['mode']}")
+
+
+def estimate_quantization_flops(numel, bits):
+    if bits is None:
+        return 0
+    if bits == 16:
+        return int(numel)
+    if bits == 8:
+        # abs/max + scale/div + round/clamp (coarse estimate).
+        return int(4 * numel)
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def estimate_dequantization_flops(numel, bits):
+    if bits is None:
+        return 0
+    if bits == 16:
+        return int(numel)
+    if bits == 8:
+        # one multiply per value.
+        return int(numel)
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def estimate_payload_compression_flops(tensor, enable_sparse_masking, bits, sparsity_compression="CSR"):
+    if enable_sparse_masking and sparsity_compression == "bitmask_values":
+        numel = int(tensor.numel())
+        nnz = int(torch.count_nonzero(tensor).item())
+        return int(numel + nnz + estimate_quantization_flops(nnz, bits))
+
+    if not (enable_sparse_masking and sparsity_compression == "CSR" and tensor.ndim in (2, 4)):
+        return estimate_quantization_flops(tensor.numel(), bits)
+    dense_2d = tensor if tensor.ndim == 2 else tensor.reshape(tensor.size(0), -1)
+    dense_numel = dense_2d.numel()
+    nnz = int(torch.count_nonzero(dense_2d).item())
+    # Dense scan + value/index materialization for non-zero entries.
+    csr_flops = dense_numel + (2 * nnz)
+    return csr_flops + estimate_quantization_flops(nnz, bits)
+
+
+def estimate_payload_decompression_flops(payload):
+    bits = payload.get("bits", None)
+    if payload["mode"] == "bitmask_values":
+        numel = int(payload.get("numel", 0))
+        nnz = int(payload.get("nnz", 0))
+        return int((2 * numel) + nnz + estimate_dequantization_flops(nnz, bits))
+
+    if payload["mode"] != "csr":
+        return estimate_dequantization_flops(payload["q_tensor"].numel(), bits)
+    dense_numel = int(payload.get("dense_numel", 0))
+    nnz = int(payload.get("nnz", 0))
+    if bits is None:
+        packet = payload.get("packet", b"")
+        if len(packet) >= 13:
+            val_bits = int(packet[12])
+            if val_bits == 8:
+                bits = 8
+            elif val_bits == 16:
+                bits = 16
+            else:
+                bits = None
+    # Zero-fill dense buffer + scatter each non-zero value.
+    csr_flops = dense_numel + nnz
+    return csr_flops + estimate_dequantization_flops(nnz, bits)
+
+
+def quantized_tensor_bytes(tensor, bits):
+    numel = tensor.numel()
+    if bits is None:
+        return numel * tensor.element_size()
+    if bits == 16:
+        return numel * 2
+    if bits == 8:
+        return numel + 4
+    raise ValueError(f"Unsupported quantization bits: {bits}")
+
+
+def compressed_quantized_tensor_bytes(tensor, compression_type, bits, dynamic_quantization=False, args=None):
+    dense_tensor = tensor.detach().cpu()
+
+    if compression_type == "Automatic":
+        if args is None or not getattr(args, "enable_sparse_masking", False):
+            return quantized_tensor_bytes(dense_tensor, bits)
+        selected, _ = select_automatic_compression_format(
+            dense_tensor, bits, dynamic_quantization,
+            getattr(args, "automatic_csr_sparsity_threshold", 0.90),
+            getattr(args, "automatic_bitmask_sparsity_threshold", 0.85),
+            getattr(args, "automatic_min_tensor_size", 1024),
+        )
+        return compressed_quantized_tensor_bytes(dense_tensor, selected, bits, dynamic_quantization)
+
+    if compression_type == "dense":
+        return quantized_tensor_bytes(dense_tensor, bits)
+
+    if compression_type == "bitmask_values":
+        numel = int(dense_tensor.numel())
+        nnz = int(torch.count_nonzero(dense_tensor).item())
+        return bitmask_payload_bytes(
+            numel,
+            nnz,
+            bits,
+            element_size=dense_tensor.element_size(),
+        )
+
+    if tensor.ndim == 1:
+        return quantized_tensor_bytes(tensor, bits)
+
+    if tensor.ndim == 2:
+        dense = dense_tensor.numpy()
+    elif tensor.ndim == 4:
+        dense = dense_tensor.reshape(dense_tensor.size(0), -1).numpy()
+    else:
+        return quantized_tensor_bytes(tensor, bits)
+
+    if compression_type == "CSR":
+        csr = compress_csr(dense)
+        values = torch.from_numpy(csr.values)
+        q_values, scale = quantize_tensor_for_transport(values, bits)
+        q_csr = type(csr)(
+            values=q_values.cpu().numpy(),
+            col_indices=csr.col_indices,
+            row_ptr=csr.row_ptr,
+            shape=csr.shape,
+        )
+        packet = pack_csr(
+            q_csr,
+            dynamic_quantization=dynamic_quantization,
+            scale=scale,
+        )
+        return len(packet)
+
+    raise ValueError(f"Unknown compression type: {compression_type}")
+
+
+def tensor_dict_payload_bytes(tensor_dict, args):
+    if args.enable_sparse_masking:
+        return sum(
+            compressed_quantized_tensor_bytes(
+                tensor,
+                args.sparsity_compression,
+                args.quantization_bits,
+                args.dynamic_quantization,
+                args,
+            )
+            for tensor in tensor_dict.values()
+        )
+    return sum(
+        quantized_tensor_bytes(tensor, args.quantization_bits)
+        for tensor in tensor_dict.values()
+    )
+
+
+def dict_to_tensor(state_dict):
+    return torch.cat([v.flatten() for v in state_dict.values()])
+
+
+def cleanup_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def apply_sparse_mask(delta_dict, param_keys, args):
+    """Apply Gauss-Southwell style masking to dense deltas.
+
+    The function keeps the payload dense (identical tensor shapes) but zeros out
+    coordinates not selected by the magnitude-based mask.
+    """
+
+    abs_delta_flat = torch.cat([delta_dict[k].abs().reshape(-1) for k in param_keys])
+    total_params = abs_delta_flat.numel()
+
+    gs_flops = 0
+
+    if not args.enable_sparse_masking or args.sparsity_rate == 0.0:
+        mask_flat = torch.ones_like(abs_delta_flat, dtype=torch.bool)
+    else:
+        gs_flops += total_params  # absolute-value scan
+        if args.sparsity_rate >= 1.0:
+            threshold = abs_delta_flat.max()
+            gs_flops += total_params
+        else:
+            threshold = torch.quantile(abs_delta_flat, args.sparsity_rate)
+            gs_flops += total_params
+        mask_flat = abs_delta_flat >= threshold
+        gs_flops += total_params
+
+        density = mask_flat.float().mean().item()
+        if density < args.sparsity_min_density:
+            k = max(1, math.ceil(args.sparsity_min_density * total_params))
+            # Recompute mask using top-k to enforce minimum density.
+            topk_values, _ = torch.topk(abs_delta_flat, k)
+            threshold = topk_values[-1]
+            mask_flat = abs_delta_flat >= threshold
+            gs_flops += total_params + k
+
+    density = mask_flat.float().mean().item()
+    sparsity = 1.0 - density
+    assert 0.0 <= sparsity <= 1.0, "Sparsity out of bounds"
+
+    delta_flat = torch.cat([delta_dict[k].reshape(-1) for k in param_keys])
+    l2_norm_delta = torch.norm(delta_flat).item()
+
+    delta_sparse = {}
+    start = 0
+    for key in param_keys:
+        numel = delta_dict[key].numel()
+        mask_tensor = mask_flat[start : start + numel].reshape(delta_dict[key].shape)
+        delta_sparse[key] = delta_dict[key] * mask_tensor
+        start += numel
+
+    delta_sparse_flat = torch.cat([delta_sparse[k].reshape(-1) for k in param_keys])
+    l2_norm_delta_sparse = torch.norm(delta_sparse_flat).item()
+
+    metrics = {
+        "total_params": total_params,
+        "nonzero_params": int(mask_flat.sum().item()),
+        "density": density,
+        "sparsity": sparsity,
+        "l2_norm_delta": l2_norm_delta,
+        "l2_norm_delta_sparse": l2_norm_delta_sparse,
+        "gs_flops": int(gs_flops),
+    }
+
+    assert metrics["nonzero_params"] <= metrics["total_params"], "Mask overflow"
+    return delta_sparse, metrics
+
+
+def is_sparse_upload_enabled(args):
+    return bool(getattr(args, "enable_sparse_masking", False))
+
+
+def has_active_sparse_mask(args):
+    sparsity_rate = getattr(args, "sparsity_rate", None)
+    return is_sparse_upload_enabled(args) and sparsity_rate is not None and sparsity_rate > 0.0
+
+
+def build_wandb_run_name(args):
+    selected_clients = int(args.n_client * args.client_fraction)
+    quantization_bits = getattr(args, "quantization_bits", None)
+
+    if has_active_sparse_mask(args):
+        compression_prefix = f"GS{quantization_bits}" if quantization_bits is not None else "GS"
+    else:
+        compression_prefix = "fedavg"
+
+    run_name_parts = [compression_prefix, args.dataset, args.model]
+
+    # The sparse serialization method is only active when sparse uploads are
+    # enabled. Otherwise, the default ``sparsity_compression=CSR`` is only an
+    # inactive configuration value and should not appear in a dense FedAvg run
+    # name.
+    if is_sparse_upload_enabled(args):
+        compression_method_label = {
+            "Automatic": "AUTO",
+            "CSR": "CSR",
+            "bitmask_values": "BITMSK",
+            "dense": "DENSE",
+        }.get(args.sparsity_compression, str(args.sparsity_compression))
+        run_name_parts.append(compression_method_label)
+
+    if has_active_sparse_mask(args):
+        sparsity_rate = getattr(args, "sparsity_rate", None)
+        sparsity_pct = sparsity_rate * 100.0 if sparsity_rate <= 1.0 else sparsity_rate
+        sparsity_label = f"{sparsity_pct:g}"
+        run_name_parts.append(sparsity_label)
+
+    run_name_parts.append(f"{selected_clients}cl")
+    return "_".join(run_name_parts)
+
+
+def main():
+    args = get_config()
+
+    selected_clients = int(args.n_client * args.client_fraction)
+    run_name = build_wandb_run_name(args)
+
+    if args.wandb_enabled:
+        wandb.init(
+            project=args.wandb_project,
+            mode=args.wandb_mode,
+            name=run_name,
+            config={k: v for k, v in vars(args).items()},
+        )
+    
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    client_train_data, client_val_data, test_data, n_classes, _, _ = get_dataset(args)
+    global_model = ResNet18(num_classes=n_classes).to(device)
+
+    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
+
+    n_clients = len(client_train_data)
+
+    val_loaders = []
+    for subset in client_val_data:
+        if len(subset) > 0:
+            val_loaders.append(DataLoader(subset, batch_size=args.batch_size, shuffle=False))
+        else:
+            val_loaders.append(None)
+
+    total_compression_flops = 0
+    total_decompression_flops = 0
+    total_gs_flops = 0
+    total_round_flops_compression = 0
+    total_flops = 0
+    num_model_params = int(sum(param.numel() for param in global_model.parameters()))
+    # output_dir = "output"
+    # os.makedirs(output_dir, exist_ok=True)
+    # flops_log_path = os.path.join(output_dir, "round_flops_metrics.csv")
+    # with open(flops_log_path, "w", newline="", encoding="utf-8") as csvfile:
+        # writer = csv.writer(csvfile)
+        # writer.writerow(
+            # [
+                # "round",
+                # "round_flops",
+                # "local_training_flops_round",
+                # "aggregation_flops_round",
+                # "evaluation_flops_round",
+                # "serialization_flops_round",
+                # "round_flops_compression",
+                # "server_compression_flops_round",
+                # "client_compression_flops_round",
+                # "server_decompression_flops_round",
+                # "client_decompression_flops_round",
+                # "total_flops",
+                # "total_flops_compression",
+                # "acc_servers_highest",
+                # "overall_traffic",
+                # "upload_traffic",
+                # "download_traffic",
+            # ]
+        # )
+
+    for round_idx in range(args.n_epoch):
+        m = max(1, int(args.client_fraction * n_clients))
+        selected = random.sample(range(n_clients), m)
+        selected_count = len(selected)
+        report = {}
+
+        cos = []
+        training_loss = []
+
+        selected_sizes = [len(client_train_data[idx]) for idx in selected]
+        assert len(selected_sizes) == selected_count
+        total_size = sum(selected_sizes)
+
+        global_params = dict_to_tensor(global_model.state_dict())
+        global_state_reference = {k: v.detach().cpu() for k, v in global_model.state_dict().items()}
+        global_state_device = {k: v.to(device) for k, v in global_state_reference.items()}
+        param_keys = list(global_state_reference.keys())
+
+        aggregated_delta = None
+        client_compression_flops_round = 0
+        server_decompression_flops_round = 0
+        server_compression_flops_round = 0
+        client_decompression_flops_round = 0
+        upload_serialization_flops_round = 0
+        download_serialization_flops_round = 0
+        gs_flops_round = 0
+        local_training_flops_accounted_round = 0
+        evaluation_flops_accounted_round = 0
+        per_client_upload_bytes = []
+        client_sparsity_metrics = []
+        bitmask_mask_bytes_round = 0
+        bitmask_value_bytes_round = 0
+        bitmask_total_bytes_round = 0
+        bitmask_nnz_round = 0
+        bitmask_numel_round = 0
+        nnz_upload_traffic = 0
+        automatic_counts_round = {"CSR": 0, "bitmask_values": 0, "dense": 0}
+        automatic_sparsity_sums_round = {"CSR": 0.0, "bitmask_values": 0.0, "dense": 0.0}
+        automatic_tensors_round = 0
+        automatic_selection_flops_round = 0
+
+        # Server -> client model broadcasts stay dense/uncompressed; only client uploads
+        # use sparsity compression. This keeps download_traffic as dense model bytes per
+        # active client and avoids applying upload-only bitmask/CSR modes to downloads.
+        for tensor in global_state_reference.values():
+            payload, _ = serialize_tensor_payload(
+                tensor,
+                bits=None,
+                enable_sparse_masking=False,
+                dynamic_quantization=False,
+                sparsity_compression="CSR",
+            )
+            server_compression_flops_round += estimate_payload_compression_flops(
+                tensor,
+                enable_sparse_masking=False,
+                bits=None,
+                sparsity_compression="CSR",
+            )
+            client_decompression_flops_round += estimate_payload_decompression_flops(payload)
+            serialization_units = estimate_payload_serialization_flops(payload)
+            # One serialization and one deserialization per active client.
+            download_serialization_flops_round += 2 * serialization_units * selected_count
+        roundtrip_download_multiplier = selected_count
+        server_compression_flops_round *= roundtrip_download_multiplier
+        client_decompression_flops_round *= roundtrip_download_multiplier
+
+        for client_order, idx in enumerate(selected):
+            # Only active/selected clients receive the current server global model.
+            local_model = copy.deepcopy(global_model)
+            loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=True)
+            if args.flops_count_method == "profiler":
+                optimizer = torch.optim.SGD(local_model.parameters(), lr=args.lr)
+                local_model.train()
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(local_model, residual_flops_state)
+                with torch.profiler.profile(with_flops=True) as prof:
+                    try:
+                        for _ in range(args.n_client_epoch):
+                            for data, target in loader:
+                                data, target = data.to(device), target.to(device)
+                                optimizer.zero_grad()
+                                output = local_model(data)
+                                loss = F.cross_entropy(output, target)
+                                loss.backward()
+                                optimizer.step()
+                    finally:
+                        for handle in residual_handles:
+                            handle.remove()
+                residual_forward_flops = int(residual_flops_state["residual_add_flops"])
+                # PyTorch profiler FLOP coverage is inconsistent for residual add in ResNet blocks.
+                # The hook observes forward residual-add FLOPs only; for local training we mirror
+                # proxy-mode semantics by adding forward + 2*forward as dense backward approximation.
+                residual_training_flops = residual_forward_flops + 2 * residual_forward_flops
+                local_training_flops_accounted_round += (
+                    _sum_profiler_flops(prof) + residual_training_flops
+                )
+                state_dict = local_model.state_dict()
+            else:
+                state_dict, client_training_flops = client_update(
+                    local_model,
+                    loader,
+                    args.n_client_epoch,
+                    device,
+                    args.lr,
+                    collect_flops=True,
+                )
+                local_training_flops_accounted_round += client_training_flops
+
+            local_params = dict_to_tensor(state_dict)
+            cos.append(F.cosine_similarity(local_params, global_params, dim=0).item())
+
+            train_loader = DataLoader(client_train_data[idx], batch_size=args.batch_size, shuffle=False)
+            if args.flops_count_method == "profiler":
+                local_model.eval()
+                loss_accum = 0.0
+                correct = 0
+                total = 0
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(local_model, residual_flops_state)
+                with torch.no_grad():
+                    with torch.profiler.profile(with_flops=True) as prof_eval_train:
+                        try:
+                            for data, target in train_loader:
+                                data, target = data.to(device), target.to(device)
+                                output = local_model(data)
+                                loss_accum += F.cross_entropy(output, target, reduction="sum").item()
+                                pred = output.argmax(dim=1)
+                                correct += (pred == target).sum().item()
+                                total += target.size(0)
+                        finally:
+                            for handle in residual_handles:
+                                handle.remove()
+                evaluation_flops_accounted_round += (
+                    _sum_profiler_flops(prof_eval_train) + int(residual_flops_state["residual_add_flops"])
+                )
+                train_loss = loss_accum / total if total > 0 else 0.0
+            else:
+                train_loss, _, client_eval_flops = evaluate(local_model, train_loader, device, collect_flops=True)
+                evaluation_flops_accounted_round += client_eval_flops
+            training_loss.append(train_loss)
+
+            delta_dict = {k: state_dict[k] - global_state_device[k] for k in param_keys}
+            dense_upload_bytes = None
+            if not args.enable_sparse_masking and args.quantization_bits is None:
+                dense_upload_bytes = serialized_tensor_dict_bytes(delta_dict)
+            # Apply Gauss-Southwell masking only for the payload that is transmitted back
+            # to the server. The dense delta is kept for local metrics and aggregation
+            # bookkeeping.
+            delta_sparse, metrics = apply_sparse_mask(delta_dict, param_keys, args)
+            state_dict_cpu = {k: v.detach().cpu() for k, v in delta_sparse.items()}
+            payload_dict = {}
+            reconstructed_state_dict = {}
+            client_upload_bytes = 0
+            for key, tensor in state_dict_cpu.items():
+                payload, payload_size = serialize_tensor_payload(
+                    tensor,
+                    args.quantization_bits,
+                    args.enable_sparse_masking,
+                    args.dynamic_quantization,
+                    args.sparsity_compression,
+                    args.automatic_csr_sparsity_threshold,
+                    args.automatic_bitmask_sparsity_threshold,
+                    args.automatic_min_tensor_size,
+                )
+                payload_dict[key] = payload
+                actual_format = payload.get("selected_format", payload.get("mode"))
+                client_compression_flops_round += estimate_payload_compression_flops(
+                    tensor,
+                    args.enable_sparse_masking,
+                    args.quantization_bits,
+                    actual_format,
+                )
+                if payload.get("requested_mode") == "Automatic":
+                    stats = payload.get("automatic_stats") or {}
+                    automatic_tensors_round += 1
+                    automatic_counts_round[actual_format] = automatic_counts_round.get(actual_format, 0) + 1
+                    automatic_sparsity_sums_round[actual_format] = (
+                        automatic_sparsity_sums_round.get(actual_format, 0.0)
+                        + float(stats.get("sparsity", 0.0))
+                    )
+                    automatic_selection_flops_round += int(stats.get("selection_flops", 0))
+                server_decompression_flops_round += estimate_payload_decompression_flops(payload)
+                upload_serialization_flops_round += 2 * estimate_payload_serialization_flops(payload)
+                reconstructed_state_dict[key] = deserialize_tensor_payload(payload)
+                client_upload_bytes += payload_size
+                nnz_upload_traffic += nnz_value_bytes_from_tensor(tensor, args.quantization_bits)
+                if payload["mode"] == "bitmask_values":
+                    mask_bytes = len(payload["packed_mask"])
+                    bitmask_mask_bytes_round += mask_bytes
+                    bitmask_value_bytes_round += payload_size - mask_bytes
+                    bitmask_total_bytes_round += payload_size
+                    bitmask_nnz_round += int(payload["nnz"])
+                    bitmask_numel_round += int(payload["numel"])
+            weight = selected_sizes[client_order] / total_size if total_size > 0 else 0.0
+
+            if aggregated_delta is None:
+                aggregated_delta = {k: tensor * weight for k, tensor in reconstructed_state_dict.items()}
+            else:
+                for key in aggregated_delta.keys():
+                    aggregated_delta[key] += reconstructed_state_dict[key] * weight
+
+            if dense_upload_bytes is not None:
+                client_upload_bytes = dense_upload_bytes
+            per_client_upload_bytes.append(client_upload_bytes)
+
+            metrics.update({"client_id": idx, "round": round_idx + 1})
+            metrics["density"] = metrics.get("density", 0.0)
+            metrics["sparsity"] = metrics.get("sparsity", 0.0)
+            assert abs(metrics["density"] + metrics["sparsity"] - 1.0) < 1e-6
+            client_sparsity_metrics.append(metrics)
+            gs_flops_round += metrics.get("gs_flops", 0)
+
+            if args.wandb_enabled:
+                log_wandb_metrics(
+                    {
+                        "client_id": idx,
+                        "round": round_idx + 1,
+                        "sparsity": metrics["sparsity"],
+                    },
+                    step=round_idx + 1,
+                    commit=False,
+                )
+
+            del local_params
+            del state_dict
+            del loader
+            del train_loader
+            del state_dict_cpu
+            del payload_dict
+            del reconstructed_state_dict
+            del local_model
+            cleanup_memory()
+
+        del global_state_reference
+        del global_state_device
+
+        aggregated_delta = aggregated_delta if aggregated_delta is not None else {}
+        global_state = global_model.state_dict()
+        for key in param_keys:
+            delta_tensor = aggregated_delta.get(key, torch.zeros_like(global_state[key]))
+            global_state[key] = global_state[key] + delta_tensor.to(global_state[key].device)
+
+        global_model.load_state_dict(global_state)
+
+        if args.flops_count_method == "profiler":
+            global_model.eval()
+            loss_sum = 0.0
+            correct = 0
+            total = 0
+            residual_flops_state = {"residual_add_flops": 0.0}
+            residual_handles = register_residual_add_flop_hooks(global_model, residual_flops_state)
+            with torch.no_grad():
+                with torch.profiler.profile(with_flops=True) as prof_eval_global:
+                    try:
+                        for data, target in test_loader:
+                            data, target = data.to(device), target.to(device)
+                            output = global_model(data)
+                            loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                            pred = output.argmax(dim=1)
+                            correct += (pred == target).sum().item()
+                            total += target.size(0)
+                    finally:
+                        for handle in residual_handles:
+                            handle.remove()
+            evaluation_flops_accounted_round += (
+                _sum_profiler_flops(prof_eval_global) + int(residual_flops_state["residual_add_flops"])
+            )
+            loss = loss_sum / total if total > 0 else 0.0
+            acc = correct / total if total > 0 else 0.0
+        else:
+            loss, acc, global_eval_flops = evaluate(global_model, test_loader, device, collect_flops=True)
+            evaluation_flops_accounted_round += global_eval_flops
+        
+        training_loss_mean = np.mean(training_loss)
+        training_loss_std = np.std(training_loss)
+
+        acc_clients = []
+        for idx, subset in enumerate(client_val_data):
+            if len(subset) == 0:
+                acc_clients.append(0.0)
+                continue
+
+            if val_loaders[idx] is None:
+                val_loaders[idx] = DataLoader(subset, batch_size=args.batch_size, shuffle=False)
+            if args.flops_count_method == "profiler":
+                loss_sum = 0.0
+                correct = 0
+                total = 0
+                residual_flops_state = {"residual_add_flops": 0.0}
+                residual_handles = register_residual_add_flop_hooks(global_model, residual_flops_state)
+                with torch.no_grad():
+                    with torch.profiler.profile(with_flops=True) as prof_eval_val:
+                        try:
+                            for data, target in val_loaders[idx]:
+                                data, target = data.to(device), target.to(device)
+                                output = global_model(data)
+                                loss_sum += F.cross_entropy(output, target, reduction="sum").item()
+                                pred = output.argmax(dim=1)
+                                correct += (pred == target).sum().item()
+                                total += target.size(0)
+                        finally:
+                            for handle in residual_handles:
+                                handle.remove()
+                evaluation_flops_accounted_round += (
+                    _sum_profiler_flops(prof_eval_val) + int(residual_flops_state["residual_add_flops"])
+                )
+                a = (correct / total) if total > 0 else 0.0
+            else:
+                _, a, client_val_flops = evaluate(global_model, val_loaders[idx], device, collect_flops=True)
+                evaluation_flops_accounted_round += client_val_flops
+            acc_clients.append(a)
+
+        acc_clients_mean = np.mean(acc_clients) if acc_clients else 0.0
+        acc_clients_std = np.std(acc_clients) if acc_clients else 0.0
+
+        acc_servers = [acc]
+        acc_servers_mean = np.mean(acc_servers)
+        acc_servers_std = np.std(acc_servers)
+
+        if client_sparsity_metrics:
+            sparsities = [m["sparsity"] for m in client_sparsity_metrics]
+            densities = [m["density"] for m in client_sparsity_metrics]
+            report["sparsity/mean"] = float(np.mean(sparsities))
+            report["sparsity/min"] = float(np.min(sparsities))
+            report["sparsity/max"] = float(np.max(sparsities))
+            report["density/mean"] = float(np.mean(densities))
+            delta_norms = [m.get("l2_norm_delta", 0.0) for m in client_sparsity_metrics]
+            delta_sparse_norms = [m.get("l2_norm_delta_sparse", 0.0) for m in client_sparsity_metrics]
+            report["delta_norm/mean"] = float(np.mean(delta_norms))
+            report["delta_sparse_norm/mean"] = float(np.mean(delta_sparse_norms))
+
+        report["training_loss_lowest"] = training_loss_mean - training_loss_std
+        report["training_loss_highest"] = training_loss_mean + training_loss_std
+        report["acc_clients_lowest"] = acc_clients_mean - acc_clients_std
+        report["acc_clients_highest"] = acc_clients_mean + acc_clients_std
+        report["acc_servers_lowest"] = acc_servers_mean - acc_servers_std
+        report["acc_servers_highest"] = acc_servers_mean + acc_servers_std
+
+        model_size_bytes = serialized_tensor_dict_bytes(global_state)
+        upload_traffic = compute_upload_traffic_for_round(per_client_upload_bytes)
+        download_traffic = compute_download_traffic_for_round(model_size_bytes, selected_count)
+        overall_traffic = compute_overall_traffic_for_round(upload_traffic, download_traffic)
+
+        client_compression_flops_round += int(automatic_selection_flops_round)
+        compression_flops_round = client_compression_flops_round + server_compression_flops_round
+        decompression_flops_round = server_decompression_flops_round + client_decompression_flops_round
+        serialization_flops_round = upload_serialization_flops_round + download_serialization_flops_round
+
+        total_compression_flops += compression_flops_round
+        total_decompression_flops += decompression_flops_round
+        total_gs_flops += gs_flops_round
+
+        local_training_flops_round = int(local_training_flops_accounted_round)
+        evaluation_flops_round = int(evaluation_flops_accounted_round)
+        aggregation_flops_round = estimate_aggregation_flops(num_model_params, selected_count)
+        if args.flops_count_method == "profiler":
+            local_training_flops_round = int(local_training_flops_accounted_round)
+            evaluation_flops_round = int(evaluation_flops_accounted_round)
+
+        round_flops = compute_round_flops(
+            local_training_flops_round,
+            aggregation_flops_round,
+            evaluation_flops_round,
+        )
+        round_flops_compression = compute_round_flops_compression(
+            compression_flops_round,
+            decompression_flops_round,
+            serialization_flops_round,
+            gs_flops_round,
+        )
+        total_round_flops_compression, total_flops = update_total_flops_metrics(
+            total_round_flops_compression,
+            total_flops,
+            round_flops_compression,
+            round_flops,
+        )
+        total_flops_compression = total_round_flops_compression
+
+        report["upload_traffic"] = upload_traffic
+        report["nnz_upload_traffic"] = int(nnz_upload_traffic)
+        report["download_traffic"] = download_traffic
+        report["overall_traffic"] = overall_traffic
+        report["compression_flops_clients"] = client_compression_flops_round
+        report["compression_flops_server"] = server_compression_flops_round
+        report["decompression_flops_clients"] = client_decompression_flops_round
+        report["decompression_flops_server"] = server_decompression_flops_round
+        report["serialization_flops"] = serialization_flops_round
+        report["round_flops_compression"] = round_flops_compression
+        report["local_training_flops_round"] = int(local_training_flops_round)
+        report["aggregation_flops_round"] = int(aggregation_flops_round)
+        report["evaluation_flops_round"] = int(evaluation_flops_round)
+        report["round_flops"] = round_flops
+        report["flops_count_method"] = args.flops_count_method
+        report["total_compression_flops"] = total_compression_flops
+        report["total_decompression_flops"] = total_decompression_flops
+        report["total_gs_flops"] = total_gs_flops
+        report["total_flops_compression"] = total_flops_compression
+        report["total_flops"] = total_flops
+        report["upload_traffic_per_client"] = float(
+            np.mean(per_client_upload_bytes) if per_client_upload_bytes else 0.0
+        )
+        report["active_clients"] = selected_count
+        if args.sparsity_compression == "Automatic":
+            report["automatic/tensors_total"] = int(automatic_tensors_round)
+            report["automatic/selection_flops"] = int(automatic_selection_flops_round)
+            for fmt in ("CSR", "bitmask_values", "dense"):
+                count = int(automatic_counts_round.get(fmt, 0))
+                report[f"automatic/{fmt}_tensors"] = count
+                report[f"automatic/{fmt}_fraction"] = (count / automatic_tensors_round) if automatic_tensors_round else 0.0
+                report[f"automatic/{fmt}_mean_sparsity"] = (
+                    automatic_sparsity_sums_round.get(fmt, 0.0) / count if count else 0.0
+                )
+
+        if args.sparsity_compression == "bitmask_values":
+            report["bitmask_values/mask_bytes"] = int(bitmask_mask_bytes_round)
+            report["bitmask_values/value_bytes"] = int(bitmask_value_bytes_round)
+            report["bitmask_values/total_bytes"] = int(bitmask_total_bytes_round)
+            report["bitmask_values/nnz"] = int(bitmask_nnz_round)
+            report["bitmask_values/numel"] = int(bitmask_numel_round)
+
+        if args.wandb_enabled:
+            log_wandb_metrics(report, step=round_idx + 1, commit=True)
+
+        # with open(flops_log_path, "a", newline="", encoding="utf-8") as csvfile:
+            # writer = csv.writer(csvfile)
+            # writer.writerow(
+                # [
+                    # round_idx + 1,
+                    # int(round_flops),
+                    # int(local_training_flops_round),
+                    # int(aggregation_flops_round),
+                    # int(evaluation_flops_round),
+                    # int(serialization_flops_round),
+                    # int(round_flops_compression),
+                    # int(server_compression_flops_round),
+                    # int(client_compression_flops_round),
+                    # int(server_decompression_flops_round),
+                    # int(client_decompression_flops_round),
+                    # int(total_flops),
+                    # int(total_flops_compression),
+                    # float(report["acc_servers_highest"]),
+                    # int(overall_traffic),
+                    # int(upload_traffic),
+                    # int(download_traffic),
+                # ]
+            # )
+
+        print(f"Round {round_idx + 1}, Clients Acc: {acc_clients}, Server Acc: {acc_servers}")
+        cleanup_memory()
+
+    print("Training complete.")
+
+
+if __name__ == "__main__":
+    main()

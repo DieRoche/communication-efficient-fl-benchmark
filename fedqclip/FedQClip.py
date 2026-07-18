@@ -16,10 +16,17 @@ from collections import defaultdict
 import gc
 
 import wandb
+from wandb_reporting import log_wandb_metrics
 from config import get_config
 from data_utils import get_dataset
 from ResNet18 import ResNet18
 from effnet import EfficientNetB0_CIFAR
+from flops_accounting import (
+    ForwardFlopCounter,
+    assert_round_flop_consistency,
+    clipping_flops_for_model,
+    trainable_parameter_count,
+)
 
 args = get_config()
 print(f"Loaded configuration: {args}")
@@ -32,6 +39,7 @@ wandb_run_name = (
 if args.wandb_enabled:
     wandb.init(
         project=args.wandb_project,
+        mode=args.wandb_mode,
         config={k: v for k, v in vars(args).items()},
         name=wandb_run_name,
     )
@@ -115,6 +123,67 @@ def tensor_dict_sparsity_mean(tensor_dict):
     return total_zeros / total_elements
 
 
+def payload_byte_size(payload):
+    """Return payload size in bytes for bytes-like or tensor-dict payloads."""
+    if isinstance(payload, (bytes, bytearray)):
+        return len(payload)
+    if isinstance(payload, dict):
+        total = 0
+        for value in payload.values():
+            if torch.is_tensor(value):
+                total += value.element_size() * value.numel()
+            elif isinstance(value, dict):
+                total += payload_byte_size(value)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    if isinstance(item, int):
+                        total += 4
+            elif isinstance(value, (int, float)):
+                total += 8
+        return total
+    return 0
+
+
+def compute_upload_traffic_for_round(client_payload_sizes):
+    """Per-round upload traffic from active clients only."""
+    return int(sum(client_payload_sizes))
+
+
+def compute_download_traffic_for_round(server_payload, num_active_clients):
+    """Per-round download traffic from server to active clients only."""
+    payload_size = payload_byte_size(server_payload)
+    return int(payload_size * num_active_clients), int(payload_size)
+
+
+def compute_overall_traffic_for_round(upload_traffic, download_traffic):
+    """Per-round total traffic."""
+    return int(upload_traffic + download_traffic)
+
+
+def compute_server_aggregation_flops(aggregated_updates, num_active_clients):
+    """
+    Estimate server-side aggregation/update FLOPs:
+    - summation across active clients
+    - averaging/scaling and model update
+    """
+    if num_active_clients <= 0:
+        return 0.0
+    aggregation_flops = 0.0
+    for tensor in aggregated_updates.values():
+        numel = tensor.numel()
+        # client summation + mean/scaling + model update arithmetic.
+        aggregation_flops += (max(0, num_active_clients - 1) * numel)
+        aggregation_flops += (3 * numel)
+    return float(aggregation_flops)
+
+
+def update_total_flops_metrics(total_round_and_serialization_flops, total_compression_path_flops, round_flops, round_flops_compression):
+    total_round_and_serialization_flops += round_flops
+    total_compression_path_flops += round_flops_compression
+    total_flops = total_round_and_serialization_flops + total_compression_path_flops
+    return total_round_and_serialization_flops, total_compression_path_flops, total_flops
+
+
 def _dtype_from_bit(bit):
     if bit <= 8:
         return torch.uint8, np.uint8
@@ -151,6 +220,26 @@ def quantize_client_payload(tensor_dict, bit):
             "values": quantized_tensor,
         }
     return quantized_payload, compression_flops
+
+
+def estimate_serialization_flops(payload, quantized=True):
+    """
+    Lightweight estimate for payload (de)serialization arithmetic.
+            # serialize_client_payload(..., quantized=False) casts to float32 before writing.
+            value_bytes = tensor.numel() * 4
+    """
+    serialization_flops = 0.0
+    for name in sorted(payload.keys()):
+        serialization_flops += len(name)
+        if quantized:
+            entry = payload[name]
+            shape = entry["shape"]
+            numel = int(np.prod(shape)) if len(shape) > 0 else 1
+            serialization_flops += len(shape) + 3 + numel
+        else:
+            tensor = payload[name]
+            serialization_flops += tensor.dim() + tensor.numel()
+    return serialization_flops
 
 
 def serialize_client_payload(payload, quantized=True):
@@ -312,15 +401,6 @@ def build_model(name: str, num_classes: int, dataset: str):
 global_model = build_model(model_name, n_classes, dataset_name).to(device)
 
 
-def estimate_flops_per_sample(model):
-    total_params = sum(p.numel() for p in model.parameters())
-    forward_flops = float(total_params)
-    return {
-        "forward": forward_flops,
-        "forward_backward": forward_flops * 2,
-    }
-
-
 def train_client(
     model,
     train_loader,
@@ -328,72 +408,91 @@ def train_client(
     gamma_c,
     num_epochs=1,
     val_loader=None,
-    flops_per_sample=None,
+    collect_flops=True,
 ):
     model.train()
     local_epoch_norm_max = 0.0
     local_norm_sum = 0.0
-    client_flops = 0.0
-    processed_samples = 0
+    client_forward_flops = 0.0
+    client_clipping_flops = 0.0
+    client_evaluation_flops = 0.0
     processed_steps = 0
-    if flops_per_sample is None:
-        flops_per_sample = estimate_flops_per_sample(model)["forward_backward"]
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        running_corrects = 0.0
+    trainable_params = trainable_parameter_count(model)
+    forward_counter = ForwardFlopCounter(model) if collect_flops else None
+    if forward_counter is not None:
+        forward_counter.register()
+    try:
+        for epoch in range(num_epochs):
+            running_loss = 0.0
+            running_corrects = 0.0
 
-        for inputs, labels in train_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            processed_samples += inputs.size(0)
-            processed_steps += 1
+            for inputs, labels in train_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                processed_steps += 1
 
-         
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            loss = criterion(outputs, labels)
+                before_forward = forward_counter.flops if forward_counter is not None else 0.0
+                outputs = model(inputs)
+                if forward_counter is not None:
+                    client_forward_flops += forward_counter.flops - before_forward
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, labels)
 
-          
-            model.zero_grad()
-            loss.backward()
+                model.zero_grad()
+                loss.backward()
 
-            
-            state_dict = model.state_dict()
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.norm(p=2)  
-                    step_size = min(eta_c, (gamma_c * eta_c) / grad_norm)
-                    state_dict[name] -= step_size * param.grad
-            model.load_state_dict(state_dict)
-            local_epoch_norm = torch.sqrt(sum(param.grad.norm(p=2) ** 2 for name, param in model.named_parameters()))
-            running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data).item()
-            if local_epoch_norm >= local_epoch_norm_max:
-                local_epoch_norm_max = local_epoch_norm.item()
-            client_flops += flops_per_sample * inputs.size(0)
-            local_norm_sum += local_epoch_norm.item()
-            # print(f'Local Epoch Norm: {local_epoch_norm:.4f}')
-        epoch_den = max(1, len(train_loader.dataset))
-        epoch_loss = running_loss / epoch_den
-        epoch_acc = running_corrects / epoch_den
-        print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+                state_dict = model.state_dict()
+                client_clipping_flops += clipping_flops_for_model(model)
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm(p=2)
+                        step_size = min(eta_c, (gamma_c * eta_c) / grad_norm)
+                        state_dict[name] -= step_size * param.grad
+                model.load_state_dict(state_dict)
+                local_epoch_norm = torch.sqrt(sum(param.grad.norm(p=2) ** 2 for name, param in model.named_parameters()))
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data).item()
+                if local_epoch_norm >= local_epoch_norm_max:
+                    local_epoch_norm_max = local_epoch_norm.item()
+                local_norm_sum += local_epoch_norm.item()
+                # print(f'Local Epoch Norm: {local_epoch_norm:.4f}')
+            epoch_den = max(1, len(train_loader.dataset))
+            epoch_loss = running_loss / epoch_den
+            epoch_acc = running_corrects / epoch_den
+            print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+    finally:
+        if forward_counter is not None:
+            forward_counter.remove()
 
     val_acc = None
     if val_loader is not None:
         model.eval()
         correct = 0.0
         total = 0
-        with torch.no_grad():
-            for v_inputs, v_labels in val_loader:
-                v_inputs = v_inputs.to(device)
-                v_labels = v_labels.to(device)
-                v_outputs = model(v_inputs)
-                _, v_preds = torch.max(v_outputs, 1)
-                correct += torch.sum(v_preds == v_labels.data).item()
-                total += v_labels.size(0)
+        val_forward_counter = ForwardFlopCounter(model) if collect_flops else None
+        if val_forward_counter is not None:
+            val_forward_counter.register()
+        try:
+            with torch.no_grad():
+                for v_inputs, v_labels in val_loader:
+                    v_inputs = v_inputs.to(device)
+                    v_labels = v_labels.to(device)
+                    before_forward = val_forward_counter.flops if val_forward_counter is not None else 0.0
+                    v_outputs = model(v_inputs)
+                    if val_forward_counter is not None:
+                        client_evaluation_flops += val_forward_counter.flops - before_forward
+                    _, v_preds = torch.max(v_outputs, 1)
+                    correct += torch.sum(v_preds == v_labels.data).item()
+                    total += v_labels.size(0)
+        finally:
+            if val_forward_counter is not None:
+                val_forward_counter.remove()
         val_acc = correct / max(1, total)
         print(f'Client Validation Acc: {val_acc:.4f}')
 
+    backward_flops = 2 * client_forward_flops
+    optimizer_update_flops = 2 * trainable_params * processed_steps
+    client_training_flops = client_forward_flops + backward_flops + optimizer_update_flops
     local_norm_den = max(1, processed_steps)
     return (
         model.state_dict(),
@@ -402,7 +501,9 @@ def train_client(
         epoch_loss,
         float(epoch_acc),
         float(val_acc) if val_acc is not None else None,
-        client_flops,
+        client_training_flops,
+        client_evaluation_flops,
+        client_clipping_flops,
     )
 
 def aggregate_models(global_model, aggregated_updates, num_participants):
@@ -422,25 +523,32 @@ def aggregate_models(global_model, aggregated_updates, num_participants):
     return global_model, param_diffs_norm, global_step_size
 
 
-def validate_model(model, val_loader, forward_flops_per_sample=None):
+def validate_model(model, val_loader, collect_flops=True):
     model.eval()
     running_loss = 0.0
     running_corrects = 0.0
     eval_flops = 0.0
-    if forward_flops_per_sample is None:
-        forward_flops_per_sample = estimate_flops_per_sample(model)["forward"]
-    with torch.no_grad():
-        for inputs, labels in val_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device, dtype=torch.long)
+    forward_counter = ForwardFlopCounter(model) if collect_flops else None
+    if forward_counter is not None:
+        forward_counter.register()
+    try:
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device, dtype=torch.long)
 
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            loss = criterion(outputs, labels)
+                before_forward = forward_counter.flops if forward_counter is not None else 0.0
+                outputs = model(inputs)
+                if forward_counter is not None:
+                    eval_flops += forward_counter.flops - before_forward
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, labels)
 
-            running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data).item()
-            eval_flops += forward_flops_per_sample * inputs.size(0)
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data).item()
+    finally:
+        if forward_counter is not None:
+            forward_counter.remove()
 
     eval_den = max(1, len(val_loader.dataset))
     val_loss = running_loss / eval_den
@@ -448,8 +556,6 @@ def validate_model(model, val_loader, forward_flops_per_sample=None):
     print(f'Validation Loss: {val_loss:.4f} Acc: {val_acc:.4f}')
     return torch.tensor(val_acc), eval_flops
 
-
-model_flops = estimate_flops_per_sample(global_model)
 
 
 trainloss_file = './trainloss' + '_'+model_name+'.txt'
@@ -460,28 +566,43 @@ f_trainloss = open(trainloss_file, 'a')
 
 total_upload_traffic = 0
 total_download_traffic = 0
+total_round_and_serialization_flops = 0.0
+total_flops_compression = 0.0
 total_flops = 0.0
-total_compression_flops = 0.0
-total_decompression_flops = 0.0
 
 # Log the initial (round 0) metrics so that WandB captures the baseline accuracy.
-initial_acc, initial_eval_flops = validate_model(
-    global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
+initial_acc, initial_eval_flops = validate_model(global_model, val_loader)
+(
+    total_round_and_serialization_flops,
+    total_flops_compression,
+    total_flops,
+) = update_total_flops_metrics(
+    total_round_and_serialization_flops,
+    total_flops_compression,
+    initial_eval_flops,
+    0.0,
 )
-total_flops += initial_eval_flops
+assert_round_flop_consistency(initial_eval_flops, 0.0, 0.0, initial_eval_flops, 0.0, 0.0)
 initial_report = {
     "round": 0,
     "acc_servers": initial_acc.item(),
     "acc_servers_lowest": initial_acc.item(),
     "acc_servers_highest": initial_acc.item(),
+    "local_training_flops_round": 0.0,
+    "aggregation_flops_round": 0.0,
+    "evaluation_flops_round": initial_eval_flops,
     "round_flops": initial_eval_flops,
     "total_flops": total_flops,
-    "total_flops_compression": total_compression_flops,
-    "total_flops_decompression": total_decompression_flops,
-    "total_flops_including_compression": total_flops,
+    "compression_flops_clients": 0.0,
+    "compression_flops_server": 0.0,
+    "decompression_flops_clients": 0.0,
+    "decompression_flops_server": 0.0,
+    "serialization_flops": 0.0,
+    "round_flops_compression": 0.0,
+    "total_flops_compression": total_flops_compression,
 }
 if args.wandb_enabled:
-    wandb.log(initial_report, step=0)
+    log_wandb_metrics(wandb, initial_report, step=0)
 print(f"Initial Validation Acc: {initial_acc.item():.4f}")
 
 for round_idx in range(num_rounds):
@@ -500,11 +621,16 @@ for round_idx in range(num_rounds):
     aggregated_updates = {
         name: torch.zeros_like(param, dtype=torch.float32) for name, param in global_state.items()
     }
+    local_training_flops_round = 0.0
+    aggregation_flops_round = 0.0
+    evaluation_flops_round = 0.0
     round_flops = 0.0
-    round_upload_traffic = 0
     round_upload_traffic_by_client = []
-    round_compression_flops = 0.0
-    round_decompression_flops = 0.0
+    round_compression_flops_clients = 0.0
+    round_compression_flops_server = 0.0
+    round_decompression_flops_clients = 0.0
+    round_decompression_flops_server = 0.0
+    round_serialization_flops = 0.0
 
     for client_id in selected_ids:
         client_dataset = client_datasets[client_id]
@@ -523,7 +649,9 @@ for round_idx in range(num_rounds):
             loss,
             _,
             val_acc_client,
-            client_flops,
+            client_training_flops,
+            client_evaluation_flops,
+            client_clipping_flops,
         ) = train_client(
             client_model,
             train_loader,
@@ -531,13 +659,14 @@ for round_idx in range(num_rounds):
             gamma_c,
             num_epochs=num_epochs_per_round,
             val_loader=val_loader,
-            flops_per_sample=model_flops["forward_backward"],
         )
         local_norm_max_all += local_norm_max
         local_norm_average_all += local_norm_average
         training_losses.append(loss)
         val_acc_clients.append(val_acc_client)
-        round_flops += client_flops
+        local_training_flops_round += client_training_flops
+        evaluation_flops_round += client_evaluation_flops
+        round_compression_flops_clients += client_clipping_flops
 
         client_tensor = dict_to_tensor(updated_state_dict).to(device)
         cos = torch.nn.functional.cosine_similarity(global_tensor, client_tensor, dim=0)
@@ -548,11 +677,15 @@ for round_idx in range(num_rounds):
         # local update -> (optional) quantization -> serialization bytes -> server deserialization/reconstruction.
         if quantize:
             quantized_payload, client_compression_flops = quantize_client_payload(update, bit)
+            upload_serialization_flops = estimate_serialization_flops(quantized_payload, quantized=True)
             serialized_payload = serialize_client_payload(quantized_payload, quantized=True)
+            upload_deserialization_flops = estimate_serialization_flops(quantized_payload, quantized=True)
             server_packet, _ = deserialize_client_payload(serialized_payload)
             reconstructed_update, client_decompression_flops = dequantize_client_payload(server_packet)
         else:
+            upload_serialization_flops = estimate_serialization_flops(update, quantized=False)
             serialized_payload = serialize_client_payload(update, quantized=False)
+            upload_deserialization_flops = estimate_serialization_flops(update, quantized=False)
             server_packet, _ = deserialize_client_payload(serialized_payload)
             reconstructed_update = {
                 name: entry["values"].detach().cpu().float() for name, entry in server_packet.items()
@@ -562,10 +695,10 @@ for round_idx in range(num_rounds):
 
         participating_updates.append(reconstructed_update)
         upload_bytes_client = len(serialized_payload)
-        round_upload_traffic += upload_bytes_client
         round_upload_traffic_by_client.append(upload_bytes_client)
-        round_compression_flops += client_compression_flops
-        round_decompression_flops += client_decompression_flops
+        round_compression_flops_clients += client_compression_flops + upload_serialization_flops
+        round_decompression_flops_server += client_decompression_flops + upload_deserialization_flops
+        round_serialization_flops += upload_serialization_flops + upload_deserialization_flops
         for name in aggregated_updates.keys():
             aggregated_updates[name] += reconstructed_update[name].to(aggregated_updates[name].device)
 
@@ -576,15 +709,11 @@ for round_idx in range(num_rounds):
     global_model, global_gradient_norm, global_step_size = aggregate_models(
         global_model, aggregated_updates, num_participants
     )
+    aggregation_flops_round = compute_server_aggregation_flops(aggregated_updates, num_participants)
 
-    acc, server_eval_flops = validate_model(
-        global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
-    )
-    round_flops += server_eval_flops
-    total_flops += round_flops
-    total_compression_flops += round_compression_flops
-    total_decompression_flops += round_decompression_flops
-
+    acc, server_eval_flops = validate_model(global_model, val_loader)
+    evaluation_flops_round += server_eval_flops
+    round_flops = local_training_flops_round + aggregation_flops_round + evaluation_flops_round
     cos_mean = np.mean(cos_sims)
     cos_std = np.std(cos_sims)
     training_loss_mean = np.mean(training_losses)
@@ -607,10 +736,12 @@ for round_idx in range(num_rounds):
     }
 
     # Download traffic is counted only for clients that actively participate this round.
+    # The downlink is uncompressed, so server-to-client serialization/deserialization FLOPs are omitted.
     global_model_packet = serialize_client_payload(global_state, quantized=False)
-    download_traffic_per_client = len(global_model_packet)
-    download_traffic = download_traffic_per_client * num_participants
-    upload_traffic = round_upload_traffic
+    download_traffic, download_traffic_per_client = compute_download_traffic_for_round(
+        global_model_packet, num_participants
+    )
+    upload_traffic = compute_upload_traffic_for_round(round_upload_traffic_by_client)
     upload_traffic_per_client = upload_traffic / num_participants
     report["num_active_clients"] = num_participants
     report["upload_traffic_per_client"] = upload_traffic_per_client
@@ -623,26 +754,54 @@ for round_idx in range(num_rounds):
     download_sparsity_mean = tensor_dict_sparsity_mean(global_state)
     total_upload_traffic += upload_traffic
     total_download_traffic += download_traffic
+    assert_round_flop_consistency(
+        round_flops,
+        local_training_flops_round,
+        aggregation_flops_round,
+        evaluation_flops_round,
+        round_compression_flops_server,
+        round_decompression_flops_clients,
+    )
+    round_flops_compression = (
+        round_compression_flops_clients
+        + round_compression_flops_server
+        + round_decompression_flops_clients
+        + round_decompression_flops_server
+    )
+    (
+        total_round_and_serialization_flops,
+        total_flops_compression,
+        total_flops,
+    ) = update_total_flops_metrics(
+        total_round_and_serialization_flops,
+        total_flops_compression,
+        round_flops,
+        round_flops_compression,
+    )
     report["upload_traffic"] = upload_traffic
     report["download_traffic"] = download_traffic
-    report["round_total_traffic"] = upload_traffic + download_traffic
+    report["round_total_traffic"] = compute_overall_traffic_for_round(upload_traffic, download_traffic)
     report["upload_sparsity_mean"] = upload_sparsity_mean
     report["download_sparsity_mean"] = download_sparsity_mean
-    report["overall_traffic"] = total_upload_traffic + total_download_traffic
+    report["overall_traffic"] = compute_overall_traffic_for_round(upload_traffic, download_traffic)
+    report["local_training_flops_round"] = local_training_flops_round
+    report["aggregation_flops_round"] = aggregation_flops_round
+    report["evaluation_flops_round"] = evaluation_flops_round
     report["round_flops"] = round_flops
     report["total_flops"] = total_flops
-    report["round_flops_compression"] = round_compression_flops
-    report["round_flops_decompression"] = round_decompression_flops
-    report["total_flops_compression"] = total_compression_flops
-    report["total_flops_decompression"] = total_decompression_flops
-    report["total_flops_including_compression"] = (
-        total_flops + total_compression_flops + total_decompression_flops
-    )
+    report["compression_flops_clients"] = round_compression_flops_clients
+    report["compression_flops_server"] = round_compression_flops_server
+    report["decompression_flops_clients"] = round_decompression_flops_clients
+    report["decompression_flops_server"] = round_decompression_flops_server
+    report["serialization_flops"] = round_serialization_flops
+    report["round_flops_compression"] = round_flops_compression
+    report["total_flops_compression"] = total_flops_compression
 
     report["round"] = round_idx + 1
+    report["client_id"] = selected_ids
 
     if args.wandb_enabled:
-        wandb.log(report, step=round_idx + 1)
+        log_wandb_metrics(wandb, report, step=round_idx + 1)
 
     print(f"Round {round_idx + 1}, Clients Val Acc: {acc_clients_mean:.4f}, Server Acc: {acc.item():.4f}")
     cleanup_memory()
